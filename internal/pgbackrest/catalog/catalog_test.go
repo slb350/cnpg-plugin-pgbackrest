@@ -131,6 +131,39 @@ var _ = Describe("pgbackrest info parsing", func() {
 		Expect(result.Databases[0].SystemID).To(Equal(int64(7487970936345972767)))
 	})
 
+	It("parses the stanza status and reports an existing stanza as present", func() {
+		result, err := NewCatalogFromPgbackrestInfo(pgbackrestInfoOutput)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(result.Status.Code).To(Equal(InfoStatusCodeOK))
+		Expect(result.StanzaMissing()).To(BeFalse())
+	})
+
+	It("reports a stanza with no valid backups as present, not missing", func() {
+		result, err := NewCatalogFromPgbackrestInfo(`[
+  {
+    "archive": [], "backup": [], "cipher": "none", "db": [],
+    "name": "cluster-example-pgbackrest",
+    "status": { "code": 2, "lock": { "backup": { "held": false } }, "message": "no valid backups" }
+  }
+]`)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(result.Status.Code).To(Equal(InfoStatusCodeNoValidBackups))
+		Expect(result.StanzaMissing()).To(BeFalse())
+	})
+
+	It("reports a non-existent stanza as missing", func() {
+		result, err := NewCatalogFromPgbackrestInfo(`[
+  {
+    "archive": [], "backup": [], "cipher": "none", "db": [],
+    "name": "cluster-example-pgbackrest",
+    "status": { "code": 1, "lock": { "backup": { "held": false } }, "message": "missing stanza path" }
+  }
+]`)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(result.Status.Code).To(Equal(InfoStatusCodeMissingStanzaPath))
+		Expect(result.StanzaMissing()).To(BeTrue())
+	})
+
 	It("must extract the latest backup id", func() {
 		result, err := NewCatalogFromPgbackrestInfo(pgbackrestInfoOutput)
 		Expect(err).ToNot(HaveOccurred())

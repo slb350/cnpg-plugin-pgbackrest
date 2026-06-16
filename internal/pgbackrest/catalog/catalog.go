@@ -335,6 +335,32 @@ type Catalog struct {
 	Stanza     string                     `json:"name"`
 	Databases  []PgbackrestBackupDatabase `json:"db"`
 	Encryption string                     `json:"cipher"`
+	Status     PgbackrestInfoStatus       `json:"status"`
+}
+
+// pgBackRest `info` per-stanza status codes (see pgBackRest src/command/info/info.c).
+const (
+	// InfoStatusCodeOK means the stanza exists and has at least one valid backup.
+	InfoStatusCodeOK = 0
+	// InfoStatusCodeMissingStanzaPath means the stanza has not been created in the repository yet.
+	InfoStatusCodeMissingStanzaPath = 1
+	// InfoStatusCodeNoValidBackups means the stanza exists but does not have any valid backup yet.
+	InfoStatusCodeNoValidBackups = 2
+)
+
+// PgbackrestInfoStatus is the per-stanza status reported by `pgbackrest info`.
+type PgbackrestInfoStatus struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// StanzaMissing reports whether `pgbackrest info` indicates that the stanza has
+// not been created in the repository yet (status "missing stanza path"). It is
+// used to decide whether stanza-create must run before WAL archiving can succeed.
+// A stanza that already exists but has no backups yet (InfoStatusCodeNoValidBackups)
+// is not considered missing.
+func (catalog *Catalog) StanzaMissing() bool {
+	return catalog.Status.Code == InfoStatusCodeMissingStanzaPath
 }
 
 // NewSingleBackupCatalogFromPgbackrestInfo parses the output of pgbackrest info

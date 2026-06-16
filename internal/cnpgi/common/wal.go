@@ -35,6 +35,7 @@ import (
 	"github.com/operasoftware/cnpg-plugin-pgbackrest/internal/cnpgi/metadata"
 	"github.com/operasoftware/cnpg-plugin-pgbackrest/internal/cnpgi/operator/config"
 	"github.com/operasoftware/cnpg-plugin-pgbackrest/internal/pgbackrest/archiver"
+	pgbackrestBackup "github.com/operasoftware/cnpg-plugin-pgbackrest/internal/pgbackrest/backup"
 	pgbackrestCommand "github.com/operasoftware/cnpg-plugin-pgbackrest/internal/pgbackrest/command"
 	pgbackrestCredentials "github.com/operasoftware/cnpg-plugin-pgbackrest/internal/pgbackrest/credentials"
 	pgbackrestRestorer "github.com/operasoftware/cnpg-plugin-pgbackrest/internal/pgbackrest/restorer"
@@ -101,12 +102,7 @@ func (w WALServiceImplementation) Archive(
 		return nil, err
 	}
 
-	envArchive, err := pgbackrestCredentials.EnvSetBackupCloudCredentials(
-		ctx,
-		w.Client,
-		archive.Namespace,
-		&archive.Spec.Configuration,
-		utils.SanitizedEnviron())
+	envArchive, err := w.backupCloudEnvironment(ctx, &archive)
 	if err != nil {
 		if apierrors.IsForbidden(err) {
 			return nil, ErrMissingPermissions
@@ -136,14 +132,32 @@ func (w WALServiceImplementation) Archive(
 		return &wal.WALArchiveResult{}, nil
 	}
 
-	// Check if we're ok to archive in the desired destination
-	err = arch.CheckWalArchiveDestination(ctx, &archive.Spec.Configuration, configuration.Stanza, envArchive)
+	stanza := archiveStanza(configuration.Stanza, &archive)
+
+	// Make sure the pgBackRest stanza exists before archiving. CNPG will not
+	// dispatch a backup until continuous archiving is healthy, but archiving
+	// cannot succeed until the stanza exists -- and the stanza was previously
+	// only created as part of a backup. That deadlocks a brand-new or wiped
+	// repository. `pgbackrest info` reports a non-existent stanza with the
+	// "missing stanza path" status, so we create it here. stanza-create is
+	// idempotent and only runs while the stanza is genuinely missing, so it does
+	// not contend with the backup lock once the cluster is healthy.
+	backups, err := pgbackrestCommand.GetBackupList(ctx, &archive.Spec.Configuration, stanza, envArchive)
 	if err != nil {
-		log.Error(err, "while checking if pgbackrest repo can be used for archival")
+		contextLogger.Error(err, "while checking if pgbackrest repo can be used for archival")
 		return nil, err
 	}
+	if backups.StanzaMissing() {
+		contextLogger.Info("pgBackRest stanza is missing, creating it before archiving",
+			"stanza", stanza)
+		backupCmd := pgbackrestBackup.NewBackupCommand(&archive.Spec.Configuration, nil, w.PGDataPath)
+		if err := backupCmd.CreatePgbackrestStanza(ctx, stanza, envArchive); err != nil {
+			contextLogger.Error(err, "while creating the pgBackRest stanza")
+			return nil, err
+		}
+	}
 
-	options, err := arch.PgbackrestWalArchiveOptions(ctx, &archive.Spec.Configuration, configuration.Stanza)
+	options, err := arch.PgbackrestWalArchiveOptions(ctx, &archive.Spec.Configuration, stanza)
 	if err != nil {
 		return nil, err
 	}
@@ -386,12 +400,7 @@ func (w WALServiceImplementation) Status(
 		return nil, err
 	}
 
-	env, err := pgbackrestCredentials.EnvSetBackupCloudCredentials(
-		ctx,
-		w.Client,
-		archive.Namespace,
-		&archive.Spec.Configuration,
-		utils.SanitizedEnviron())
+	env, err := w.backupCloudEnvironment(ctx, &archive)
 	if err != nil {
 		if apierrors.IsForbidden(err) {
 			return nil, ErrMissingPermissions
@@ -399,7 +408,9 @@ func (w WALServiceImplementation) Status(
 		return nil, err
 	}
 
-	backupCatalog, err := pgbackrestCommand.GetBackupList(ctx, &archive.Spec.Configuration, configuration.Stanza, env)
+	stanza := archiveStanza(configuration.Stanza, &archive)
+
+	backupCatalog, err := pgbackrestCommand.GetBackupList(ctx, &archive.Spec.Configuration, stanza, env)
 	if err != nil {
 		return nil, err
 	}
@@ -423,6 +434,28 @@ func (w WALServiceImplementation) SetFirstRequired(
 ) (*wal.SetFirstRequiredResult, error) {
 	// TODO implement me
 	panic("implement me")
+}
+
+func archiveStanza(pluginStanza string, archive *pgbackrestv1.Archive) string {
+	if len(archive.Spec.Configuration.Stanza) != 0 {
+		return archive.Spec.Configuration.Stanza
+	}
+
+	return pluginStanza
+}
+
+func (w WALServiceImplementation) backupCloudEnvironment(
+	ctx context.Context,
+	archive *pgbackrestv1.Archive,
+) ([]string, error) {
+	osEnvironment := utils.SanitizedEnviron()
+	caBundleEnvironment := GetRestoreCABundleEnv(&archive.Spec.Configuration)
+	return pgbackrestCredentials.EnvSetBackupCloudCredentials(
+		ctx,
+		w.Client,
+		archive.Namespace,
+		&archive.Spec.Configuration,
+		MergeEnv(osEnvironment, caBundleEnvironment))
 }
 
 // isStreamingAvailable checks if this pod can replicate via streaming connection.
